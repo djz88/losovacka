@@ -1,0 +1,4 @@
+Django>=4.2
+requests>=2.31
+# odkomentuj gunicorn pro produkci či potřebu:
+#gunicorn>=23.0

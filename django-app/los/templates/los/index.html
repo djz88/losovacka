@@ -1,0 +1,109 @@
+{% load static %}
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <title>Losovačka – UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 1rem; }
+    .card h2 { margin-top: 0; }
+    label { font-weight: 600; display: block; margin-top: .5rem; }
+    input[type=text], input[type=url], textarea {
+      width: 100%; padding: .5rem; border: 1px solid #ccc; border-radius: 6px;
+    }
+    .help { color: #666; font-size: .9rem; margin-bottom: .5rem; }
+    .btn { margin-top: 1rem; padding: .6rem 1rem; border: 0; border-radius: 6px; background: #0d6efd; color: #fff; cursor: pointer; }
+    .btn-secondary { background: #6c757d; }
+    .err { color: #dc3545; margin: .3rem 0; }
+    .ok { color: #198754; font-weight: 700; }
+    .bad { color: #dc3545; font-weight: 700; }
+    .monospace { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    pre { background: #f8f9fa; padding: .8rem; border-radius: 6px; overflow-x: auto; }
+    ul.errorlist { margin: .3rem 0; color: #dc3545; }
+  </style>
+</head>
+<body>
+  <h1>Losovačka (NIST + drand + Bitcoin block)</h1>
+
+  {% if error_msg %}
+    <p class="bad">Chyba: {{ error_msg }}</p>
+  {% endif %}
+
+  <div class="row">
+    <div class="card">
+      <h2>Spustit losování</h2>
+      <form method="post" action="">
+        {% csrf_token %}
+
+        {% if run_form.non_field_errors %}
+          <div class="err">{{ run_form.non_field_errors }}</div>
+        {% endif %}
+
+        <label>Účastníci (CSV)</label>
+        {{ run_form.items }}
+        {% if run_form.items.errors %}<div class="err">{{ run_form.items.errors }}</div>{% endif %}
+        <div class="help">{{ run_form.fields.items.help_text }}</div>
+
+        <label>Čas (UTC, minuta, ISO)</label>
+        {{ run_form.when }}
+        {% if run_form.when.errors %}<div class="err">{{ run_form.when.errors }}</div>{% endif %}
+        <div class="help">{{ run_form.fields.when.help_text }}</div>
+
+        <label>{{ run_form.fair }} {{ run_form.fields.fair.label }}</label>
+        {% if run_form.fair.errors %}<div class="err">{{ run_form.fair.errors }}</div>{% endif %}
+
+        <button class="btn" name="action" value="run">Spustit</button>
+      </form>
+
+      {% if run_result %}
+        <hr>
+        <p><strong>Pořadí:</strong> {{ run_result.result|join:" | " }}</p>
+        <p><strong>Ověření (CLI):</strong> <span class="monospace">{{ run_result.invocation.cli_verify }}</span></p>
+        <p><strong>Ověřit ve webu:</strong> <a class="monospace" href="{{ run_result.invocation.repro_url }}" target="_blank" rel="noopener">{{ run_result.invocation.repro_url }}</a></p>
+        <h3>Audit JSON</h3>
+        <pre class="monospace">{{ run_result_pretty }}</pre>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Ověřit cizí audit</h2>
+      <form method="post" action="">
+        {% csrf_token %}
+
+        {% if verify_form.non_field_errors %}
+          <div class="err">{{ verify_form.non_field_errors }}</div>
+        {% endif %}
+
+        <label>URL s audit JSON</label>
+        {{ verify_form.audit_url }}
+        {% if verify_form.audit_url.errors %}<div class="err">{{ verify_form.audit_url.errors }}</div>{% endif %}
+
+        <label>nebo vlož Audit JSON</label>
+        {{ verify_form.audit_json }}
+        {% if verify_form.audit_json.errors %}<div class="err">{{ verify_form.audit_json.errors }}</div>{% endif %}
+
+        <button class="btn btn-secondary" name="action" value="verify">Ověřit</button>
+      </form>
+
+      {% if verify_status %}
+        <hr>
+        <p>Status: {% if verify_status == "VERIFIED" %}<span class="ok">{{ verify_status }}</span>{% else %}<span class="bad">{{ verify_status }}</span>{% endif %}</p>
+
+        {% if verify_result_pretty %}
+          <h3>Audit (předložený)</h3>
+          <pre class="monospace">{{ verify_result_pretty }}</pre>
+        {% endif %}
+
+        {% if verify_details_pretty %}
+          <h3>Detail porovnání</h3>
+          <pre class="monospace">{{ verify_details_pretty }}</pre>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+</body>
+</html>
+
