@@ -25,12 +25,18 @@ import os
 import shlex
 import sys
 from hashlib import sha256
+import time
 from typing import Any, Dict, List, Tuple
 
 # ------------------ minimální ověření prostředí ------------------
 
 MIN_PY = (3, 9)
 REQ_REQUESTS_VER = "2.31.0"
+# Sjednoceni timeoutu při žádosti pro rúzné verze urllib3 či pomalé připojení
+HTTP_CONNECT_TIMEOUT = float(os.getenv("LOS_HTTP_CONNECT_TIMEOUT", "5"))
+HTTP_READ_TIMEOUT    = float(os.getenv("LOS_HTTP_READ_TIMEOUT", "45"))
+HTTP_RETRIES         = int(os.getenv("LOS_HTTP_RETRIES", "3"))
+HTTP_BACKOFF         = float(os.getenv("LOS_HTTP_BACKOFF", "0.75"))
 
 def _fail(msg: str, exit_code: int = 2) -> None:
     sys.stderr.write(f"Chyba: {msg}\n")
@@ -87,10 +93,10 @@ def log(msg: str, enabled: bool) -> None:
     sys.stderr.write(f"[{ts}] {msg}\n")
     sys.stderr.flush()
 
-# ------------------ pomocné GETy s lepšími chybami ------------------
+# ------------------ pomocné funkce s lepšími chybami ------------------
 
 def _get_json(url: str, timeout: int = 15):
-    r = requests.get(url, timeout=timeout)
+    r = _http_get(url, timeout=timeout)
     try:
         r.raise_for_status()
     except Exception as e:
@@ -102,9 +108,25 @@ def _get_json(url: str, timeout: int = 15):
         raise RuntimeError(f"Neplatná JSON odpověď z {url}. Začátek: {preview!r}") from e
 
 def _get_text(url: str, timeout: int = 15) -> str:
-    r = requests.get(url, timeout=timeout)
+    r = _http_get(url, timeout=timeout)
     r.raise_for_status()
     return (r.text or "").strip()
+
+def _http_get(url: str, timeout=None):
+    tout = timeout or (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
+    last = None
+    for attempt in range(HTTP_RETRIES):
+        try:
+            return requests.get(url, timeout=tout)
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            last = e
+            if attempt < HTTP_RETRIES - 1:
+                time.sleep(HTTP_BACKOFF * (2 ** attempt))
+            else:
+                raise
+
+def _canon_json(obj) -> str:
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True)
 
 # ------------------ čas a vstupy ------------------
 
@@ -293,7 +315,7 @@ Příklady:
 
     ap.add_argument("--commit-file", help="Ve fair režimu uloží COMMIT JSON do souboru.")
     ap.add_argument("--commit-stdout", action="store_true", help="Vypíše COMMIT ID/JSON i na stdout (default: ne).")
-    ap.add_argument("--base-url", help="Základ webu pro generování repro URL, např. 'https://mojedomena.tld'.")    
+    ap.add_argument("--base-url", help="Základ webu pro generování repro URL, např. 'https://mojedomena.tld'.") 
 
     args = ap.parse_args()
 
@@ -362,10 +384,7 @@ Příklady:
     if not isinstance(drand_hex, str):
         _fail("drand randomness missing")
 
-    extra_entropy = json.dumps(
-        {"btc_height": btc_meta["height"], "btc_hash": btc_meta["hash"]},
-        separators=(",", ":")
-    )
+    extra_entropy = _canon_json({"btc_height": btc_meta["height"], "btc_hash": btc_meta["hash"]})
 
     ikm = "|".join([
         nist_hex.lower(),
@@ -373,45 +392,13 @@ Příklady:
         extra_entropy,
     ]).encode("utf-8")
 
-    salt = hashlib.sha256(json.dumps({
-        "when": when_used_iso,
-        "drand_round": str(drand_meta["round"]),
-    }, separators=(",", ":")).encode("utf-8")).digest()
-
-    def hkdf_extract(salt_b: bytes, ikm_b: bytes) -> bytes:
-        return hmac.new(salt_b, ikm_b, hashlib.sha256).digest()
-
-    def hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
-        out = b""; T = b""; c = 1
-        while len(out) < length:
-            T = hmac.new(prk, T + info + bytes([c]), hashlib.sha256).digest()
-            out += T; c += 1
-        return out[:length]
-
-    def next_u64(ks: bytes, pos: int) -> Tuple[int, int]:
-        if pos + 8 > len(ks):
-            _fail("Keystream too short")
-        return int.from_bytes(ks[pos:pos+8], "big"), pos + 8
-
-    def unbiased_upto(n_inclusive: int, ks: bytes, pos: int) -> Tuple[int, int]:
-        m = n_inclusive + 1
-        limit = (1 << 64) - ((1 << 64) % m) - 1
-        while True:
-            r, pos = next_u64(ks, pos)
-            if r <= limit:
-                return r % m, pos
-
-    def shuffle_items_local(items_l: List[str], keystream: bytes) -> List[str]:
-        arr = list(items_l); i = len(arr) - 1; pos = 0
-        while i > 0:
-            j, pos = unbiased_upto(i, keystream, pos)
-            arr[i], arr[j] = arr[j], arr[i]
-            i -= 1
-        return arr
+    salt = hashlib.sha256(
+        _canon_json({"when": when_used_iso, "drand_round": str(drand_meta["round"])}).encode("utf-8")
+    ).digest()
 
     prk = hkdf_extract(salt, ikm)
     ks = hkdf_expand(prk, INFO_TAG, (len(items) * 8) + 64)
-    ordering = shuffle_items_local(items, ks)
+    ordering = shuffle_items(items, ks)
 
     # Ověřovací příkaz
     cli_verify = build_cli_verify(os.path.basename(sys.argv[0]) or "auditable_losovacka.py",

@@ -12,13 +12,20 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import os
+import requests
 import shlex
 import urllib.parse
+import time
 from typing import Any, Dict, List, Tuple, Optional
 
-import requests
 
 INFO_TAG = b"auditable-draw-v2"
+# Sjednoceni timeoutu při žádosti pro rúzné verze urllib3 či pomalé připojení
+HTTP_CONNECT_TIMEOUT = float(os.getenv("LOS_HTTP_CONNECT_TIMEOUT", "5"))
+HTTP_READ_TIMEOUT    = float(os.getenv("LOS_HTTP_READ_TIMEOUT", "45"))  # bývalo 15
+HTTP_RETRIES         = int(os.getenv("LOS_HTTP_RETRIES", "3"))
+HTTP_BACKOFF         = float(os.getenv("LOS_HTTP_BACKOFF", "0.75"))     # expo backoff základ
 
 # Endpoints
 NIST_BASE   = "https://beacon.nist.gov/beacon/2.0"
@@ -29,10 +36,10 @@ DRAND_ROUND = "https://drand.cloudflare.com/public/{round}"
 BLOCKSTREAM_API = "https://blockstream.info/api"
 
 
-# ---------- Pomocné GETy s rozumnými chybami ----------
+# ---------- Pomocné funkce s rozumnými chybami ----------
 
 def _get_json(url: str, timeout: int = 15):
-    r = requests.get(url, timeout=timeout)
+    r = _http_get(url, timeout)
     try:
         r.raise_for_status()
     except Exception as e:
@@ -44,10 +51,25 @@ def _get_json(url: str, timeout: int = 15):
         raise RuntimeError(f"Neplatná JSON odpověď z {url}. Začátek: {preview!r}") from e
 
 def _get_text(url: str, timeout: int = 15) -> str:
-    r = requests.get(url, timeout=timeout)
+    r = _http_get(url, timeout)
     r.raise_for_status()
     return (r.text or "").strip()
 
+def _http_get(url: str, timeout=None):
+    tout = timeout or (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
+    last = None
+    for attempt in range(HTTP_RETRIES):
+        try:
+            return requests.get(url, timeout=tout)
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            last = e
+            if attempt < HTTP_RETRIES - 1:
+                time.sleep(HTTP_BACKOFF * (2 ** attempt))
+            else:
+                raise
+
+def _canon_json(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True)
 
 # ---------- Čas a vstupy ----------
 
@@ -175,19 +197,19 @@ def shuffle_items(items: List[str], keystream: bytes) -> List[str]:
 
 # ---------- Builders pro CLI a WEB ověření ----------
 
-def build_cli_verify(script_name: str, when_iso: str, items: List[str]) -> str:
+def build_cli_verify(script_name: str, when_used_iso: str, items: List[str]) -> str:
     """Postaví spustitelný příkaz pro shell (CSV je jeden argument)."""
     items_csv = ",".join(items)
-    cmd = ["python", script_name, "--when", when_iso, "--items", items_csv]
+    cmd = ["python", script_name, "--when", when_used_iso, "--items", items_csv]
     return " ".join(shlex.quote(c) for c in cmd)
 
-def build_web_verify_url(base_url: Optional[str], when_iso: str, items: List[str]) -> str:
+def build_web_verify_url(base_url: Optional[str], when_used_iso: str, items: List[str]) -> str:
     """
     Postaví URL na webový endpoint /draw/ (relativní nebo absolutní).
     Používá 'when' (i když běželo fair), aby bylo jednoznačné.
     """
     items_csv = ",".join(items)
-    qs = urllib.parse.urlencode({"items": items_csv, "when": when_iso, "pretty": "1"})
+    qs = urllib.parse.urlencode({"items": items_csv, "when": when_used_iso, "pretty": "1"})
     base = (base_url.rstrip("/") if base_url else "")
     return (f"{base}/draw/?{qs}") if base else (f"/draw/?{qs}")
 
@@ -196,7 +218,7 @@ def build_web_verify_url(base_url: Optional[str], when_iso: str, items: List[str
 
 def compute_draw(
     items_csv: str,
-    when_iso: str | None,
+    when_used_iso: str | None,
     fair: bool,
     script_name_for_cli: str = "auditable_losovacka.py",
     base_url: Optional[str] = None,
@@ -204,7 +226,7 @@ def compute_draw(
     """
     Spočítá los (pořadí) + vrátí plný auditní JSON.
     - items_csv: povinné CSV položek
-    - when_iso: ISO čas minuty; pokud None a fair=True → použije PŘEDCHOZÍ minutu
+    - when_used_iso: ISO čas minuty; pokud None a fair=True → použije PŘEDCHOZÍ minutu
     - fair: True = commit pro předchozí minutu (bez čekání)
     - base_url: volitelné; pokud zadáno, 'repro_url' bude absolutní
     """
@@ -215,10 +237,10 @@ def compute_draw(
     if fair:
         when_dt = prev_full_minute(now_utc)
     else:
-        if not when_iso:
+        if not when_used_iso:
             raise ValueError("Chybí 'when' (ISO) nebo 'fair=1'.")
-        when_dt = parse_when_iso(when_iso)
-    when_iso = when_dt.isoformat().replace("+00:00","Z")
+        when_dt = parse_when_iso(when_used_iso)
+    when_used_iso = when_dt.isoformat().replace("+00:00","Z")
     when_is_past = when_dt <= now_utc
 
     # Zdroje: NIST + drand + BTC blok ≤ when
@@ -232,10 +254,7 @@ def compute_draw(
     drand_hex = drand_json.get("randomness")
     if not isinstance(drand_hex, str): raise RuntimeError("drand randomness missing")
 
-    extra_entropy = json.dumps(
-        {"btc_height": btc_meta["height"], "btc_hash": btc_meta["hash"]},
-        separators=(",", ":")
-    )
+    extra_entropy = _canon_json({"btc_height": btc_meta["height"], "btc_hash": btc_meta["hash"]})
 
     ikm = "|".join([
         nist_hex.lower(),
@@ -243,17 +262,16 @@ def compute_draw(
         extra_entropy,
     ]).encode("utf-8")
 
-    salt = hashlib.sha256(json.dumps({
-        "when": when_iso,
-        "drand_round": str(drand_meta["round"]),
-    }, separators=(",",":")).encode("utf-8")).digest()
+    salt = hashlib.sha256(
+        _canon_json({"when": when_used_iso, "drand_round": str(drand_meta["round"])}).encode("utf-8")
+    ).digest()
 
     prk = hkdf_extract(salt, ikm)
     ks = hkdf_expand(prk, INFO_TAG, (len(items)*8)+64)
 
     ordering = shuffle_items(items, ks)
-    cli_verify = build_cli_verify(script_name_for_cli, when_iso, items)
-    web_verify = build_web_verify_url(base_url, when_iso, items)
+    cli_verify = build_cli_verify(script_name_for_cli, when_used_iso, items)
+    web_verify = build_web_verify_url(base_url, when_used_iso, items)
 
     # Audit JSON
     audit: Dict[str, Any] = {
@@ -273,7 +291,7 @@ def compute_draw(
         },
         "params": {
             "items": items,
-            "when_utc_minute": when_iso,
+            "when_utc_minute": when_used_iso,
         },
         "sources": {
             "nist": {"url": nist_url, "timeStamp": (nist_json.get("pulse", {}) or nist_json).get("timeStamp")},
@@ -302,7 +320,7 @@ def compute_draw(
                 "fair_previous_minute": True,
                 "third_source": "btc_block",
             },
-            "when_utc_minute": when_iso,
+            "when_utc_minute": when_used_iso,
             "created_at_utc": now_utc.isoformat().replace("+00:00","Z"),
             "note": "COMMIT pro PŘEDCHOZÍ minutu (bez čekání).",
         }
